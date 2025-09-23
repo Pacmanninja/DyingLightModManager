@@ -45,8 +45,7 @@ except Exception:
 # ---- App constants
 APP_NAME = "Dying Light The Beast Mod Manager and Merger"
 SETTINGS_FILENAME = "settings.json"
-DEFAULT_GAME_DIR = r"C:\Program Files (x86)\Steam\steamapps\common\Dying Light The Beast\ph_ft\source"
-
+possible_drives = ["D:", "E:", "F:", "C:"]
 
 # ---- Settings I/O (safe path + atomic write)
 def _default_settings_dir(app_name: str = APP_NAME) -> Path:
@@ -574,9 +573,19 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.settings = load_settings()
-        if not self.settings.get("game_folder") and os.path.exists(DEFAULT_GAME_DIR):
-            self.settings["game_folder"] = DEFAULT_GAME_DIR
-            save_settings(self.settings)
+        if not self.settings.get("game_folder"):
+            found_path = None
+            possible_drives = [chr(x) for x in range(ord('A'), ord('Z') + 1)]
+            for drive in possible_drives:
+                candidate = Path(f"{drive}:\\Program Files (x86)\\Steam\\steamapps\\common\\Dying Light The Beast\\ph_ft\\source")
+                print(f"Trying: {candidate}")
+                if candidate.exists():
+                    found_path = str(candidate)
+                    break
+            if found_path:
+                dir_path = Path(found_path)
+                self.settings["game_folder"] = found_path
+                save_settings(self.settings)
         # Theme before building widgets
         self.dark_mode = bool(self.settings.get("dark_mode", False))
         self.palette: Dict[str, str] = {}
