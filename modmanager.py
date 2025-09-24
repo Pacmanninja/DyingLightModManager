@@ -407,6 +407,9 @@ def merge_scripts(
             if not key:
                 continue
             if key in original_map and original_map[key] != line:
+                if original.source.endswith("data0.pak"):
+                    original_map[key] = line
+                    continue
                 if preferred_source_for_file == original.source:
                     continue  # keep existing original
                 if preferred_source_for_file == mod.source:
