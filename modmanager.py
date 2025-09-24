@@ -1,9 +1,17 @@
 # file: tool.py
 """
 Dying Light: The Beast — Mod Manager + Merger (GUI)
-- Fixed theme error: avoid Tk option_get() returning "", use our own palette.
-- Dark Mode toggle (persisted).
-- Settings saved to a user-writable path with atomic writes.
+
+Adds support for installing/merging mods packed as .zip/.rar/.7z (archives
+that contain .pak inside), fixes startup/closing issues, and includes a
+dark mode + simple settings persistence.
+
+Usage:
+  pip install rarfile py7zr
+  # For .rar support also install one of: unrar / unar / bsdtar (on PATH)
+  # Optional: install 7-Zip for CLI fallback (7z.exe on PATH)
+
+  python tool.py
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ import queue
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -21,69 +30,62 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple, Iterator
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 
-# PyInstaller bundle TKDND init (why: allow drag/drop in a frozen build)
-if getattr(sys, "frozen", False):
-    tkdnd_lib = os.path.join(sys._MEIPASS, "tkinterdnd2", "tkdnd")  # type: ignore[attr-defined]
-    os.environ["TKDND_LIBRARY"] = tkdnd_lib
+# Optional archive libs (.rar/.7z)
+try:
+    import rarfile  # type: ignore
+except Exception:
+    rarfile = None  # type: ignore
+
+try:
+    import py7zr  # type: ignore
+except Exception:
+    py7zr = None  # type: ignore
+
+# PyInstaller bundle TKDND init
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    _tcldir = Path(sys._MEIPASS) / "tcl"
+    if _tcldir.exists():
+        os.environ["TCL_LIBRARY"] = str(_tcldir)
 
 # Optional tkinterdnd2 (drag & drop)
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES  # type: ignore
-
     TKDND_OK = True
 except Exception:
     TkinterDnD = None  # type: ignore
     DND_FILES = None  # type: ignore
     TKDND_OK = False
 
-
 # ---- App constants
 APP_NAME = "Dying Light The Beast Mod Manager and Merger"
 SETTINGS_FILENAME = "settings.json"
-possible_drives = ["D:", "E:", "F:", "C:"]
+DEFAULT_GAME_DIR = r"D:\Program Files (x86)\Steam\steamapps\common\Dying Light The Beast\ph_ft\source"
 
-# ---- Settings I/O (safe path + atomic write)
-def _default_settings_dir(app_name: str = APP_NAME) -> Path:
-    # Why: avoid protected folders (Program Files / CWD)
-    if os.name == "nt":
-        base = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return Path(base) / app_name
-    xdg = os.getenv("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
-    return base / app_name
+# ---- Small utils
 
+def get_user_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = Path(base) / "DLTBeast_Mod_Manager"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-def get_settings_path(filename: str = SETTINGS_FILENAME) -> Path:
-    return _default_settings_dir() / filename
-
+def get_settings_path() -> Path:
+    return get_user_data_dir() / SETTINGS_FILENAME
 
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-
 def _ensure_writable(path: Path) -> None:
-    # Why: some extracted files are read-only on Windows
-    if path.exists():
-        try:
-            mode = path.stat().st_mode
-            path.chmod(mode | stat.S_IWRITE)
-        except Exception:
-            pass
-
-
-def _atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    with open(tmp, "w", encoding=encoding) as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, target)
-
+    try:
+        if path.exists():
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
 
 def load_settings() -> Dict:
     path = get_settings_path()
@@ -98,257 +100,387 @@ def load_settings() -> Dict:
     data.setdefault("dark_mode", False)
     return data
 
-
 def save_settings(settings: Dict) -> Path:
     path = get_settings_path()
     _ensure_parent_dir(path)
     _ensure_writable(path)
     payload = json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True)
-    try:
-        _atomic_write_text(path, payload)
-        print(f"Saving settings to {path}")
-        return path
-    except PermissionError:
-        # Last-resort fallback if AppData blocked
-        fb = Path.home() / f".{APP_NAME.replace(' ', '_').lower()}" / SETTINGS_FILENAME
-        _ensure_parent_dir(fb)
-        _ensure_writable(fb)
-        _atomic_write_text(fb, payload)
-        return fb
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+    os.replace(tmp, path)
+    return path
 
-
-# ---- Data & helpers
-@dataclass
-class ScriptFile:
-    full_path_in_pak: str
-    content: str
-    source_pak: str
-
+def next_data_name(folder: str) -> str:
+    i = 0
+    while True:
+        name = f"data{i}.pak"
+        if not os.path.exists(os.path.join(folder, name)):
+            return name
+        i += 1
 
 def parse_drop_files(event_data: str) -> List[str]:
-    # Handles Windows paths with spaces/braces
-    pat = re.compile(r"\{([^}]+)\}|(\S+)")
-    return [a or b for a, b in pat.findall(event_data)]
+    r"""Parse the native DND_FILES string into a list of absolute paths.
 
+    On Windows: {C:\path one\file.pak} {C:\path two\file.zip}
+    On macOS/Linux it may be a space-separated list; we handle braces and quotes.
+    """
+    out: List[str] = []
+    token: List[str] = []
+    in_brace = False
+    for ch in event_data:
+        if ch == "{":
+            in_brace = True
+            if token:
+                out.append("".join(token).strip())
+                token = []
+            continue
+        if ch == "}":
+            in_brace = False
+            out.append("".join(token))
+            token = []
+            continue
+        if ch == " " and not in_brace:
+            if token:
+                out.append("".join(token))
+                token = []
+            continue
+        token.append(ch)
+    if token:
+        out.append("".join(token))
+    return out
 
-def safe_mkdir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+# ---- PAK reading & merging
 
+@dataclass
+class ScriptFile:
+    rel_path: str
+    content: str
+    source: str
 
-def next_data_name(game_folder: str) -> str:
-    # Reserve >= data3.pak to avoid base game packages
-    existing = [
-        f for f in os.listdir(game_folder)
-        if f.startswith("data") and (f.endswith(".pak") or f.endswith(".pak.disabled"))
-    ]
-    used = set()
-    for f in existing:
-        num_part = f[4:].split(".")[0]
-        if num_part.isdigit():
-            used.add(int(num_part))
-    n = 3
-    while n in used:
-        n += 1
-    return f"data{n}.pak"
+@dataclass
+class GameStructure:
+    known: set
 
-
-def get_game_file_structure(game_pak_path: Path) -> Dict[str, str]:
-    structure: Dict[str, str] = {}
-    with zipfile.ZipFile(game_pak_path, "r") as archive:
-        for entry in archive.namelist():
-            if entry.endswith(".scr") and not entry.endswith("/"):
-                file_name = os.path.basename(entry)
-                full_path = entry.replace("/", "\\")
-                if file_name.lower() not in (k.lower() for k in structure.keys()):
-                    structure[file_name] = full_path
-    return structure
-
-
-def read_scripts_from_single_pak_for_fixing(
-    pak_path_or_stream, needs_fixing_flag: List[bool], file_structure: Dict[str, str], unknown_files: List[str]
-) -> List[Tuple[str, str, "BytesIO"]]:
-    if isinstance(pak_path_or_stream, (str, Path)):
-        archive = zipfile.ZipFile(pak_path_or_stream, "r")
-    else:
-        pak_path_or_stream.seek(0)
-        archive = zipfile.ZipFile(pak_path_or_stream, "r")
-
-    mod_scripts = []
-    try:
-        for entry in archive.namelist():
-            if entry.endswith(".scr") and not entry.endswith("/"):
-                file_name = os.path.basename(entry)
-                mod_path = entry.replace("/", "\\")
-                correct_path = file_structure.get(file_name)
-                if correct_path:
-                    if mod_path.lower() != correct_path.lower():
-                        needs_fixing_flag[0] = True
-                    content = archive.read(entry)
-                    from io import BytesIO
-
-                    memory_stream = BytesIO(content)
-                    mod_scripts.append((file_name, correct_path, memory_stream))
-                else:
-                    unknown_files.append(mod_path)
-    finally:
-        archive.close()
-    return mod_scripts
-
+def get_game_file_structure(game_pak_path: Path) -> GameStructure:
+    known: set = set()
+    with zipfile.ZipFile(game_pak_path, "r") as z:
+        for n in z.namelist():
+            if n.lower().endswith(".scr"):
+                known.add(n.replace("\\", "/"))
+    return GameStructure(known=known)
 
 def read_scripts_from_single_pak(pak_path_or_stream, source_name: str) -> List[ScriptFile]:
-    if isinstance(pak_path_or_stream, (str, Path)):
-        archive = zipfile.ZipFile(pak_path_or_stream, "r")
+    if isinstance(pak_path_or_stream, (str, os.PathLike, Path)):
+        z = zipfile.ZipFile(pak_path_or_stream, "r")
+        close = True
     else:
-        pak_path_or_stream.seek(0)
-        archive = zipfile.ZipFile(pak_path_or_stream, "r")
-
+        z = zipfile.ZipFile(pak_path_or_stream, "r")
+        close = True
     scripts: List[ScriptFile] = []
     try:
-        for entry in archive.namelist():
-            if entry.endswith(".scr"):
-                with archive.open(entry) as scr_stream:
-                    data = scr_stream.read()
+        for entry in z.namelist():
+            if entry.lower().endswith(".scr"):
+                with z.open(entry) as f:
                     try:
-                        content = data.decode("utf-8")
+                        content = f.read().decode("utf-8")
                     except UnicodeDecodeError:
-                        try:
-                            content = data.decode("latin1")
-                        except Exception:
-                            content = data.decode("utf-8", errors="replace")
-                    scripts.append(ScriptFile(entry.replace("\\", "/"), content, source_name))
+                        content = f.read().decode("utf-8", errors="replace")
+                scripts.append(ScriptFile(rel_path=entry.replace("\\", "/"), content=content, source=source_name))
     finally:
-        archive.close()
+        if close:
+            z.close()
     return scripts
 
+def read_scripts_from_single_pak_for_fixing(
+    pak_path_or_stream, needs_fixing: List[bool], structure: GameStructure, unknown_files_out: List[str]
+) -> List[Tuple[str, str, "tempfile.SpooledTemporaryFile"]]:
+    z = zipfile.ZipFile(pak_path_or_stream, "r")
+    scripts: List[Tuple[str, str, "tempfile.SpooledTemporaryFile"]] = []
+    try:
+        for entry in z.namelist():
+            if entry.endswith("/"):
+                continue
+            with z.open(entry) as f:
+                data = f.read()
+            if entry.lower().endswith(".scr"):
+                norm = entry.replace("\\", "/")
+                if norm in structure.known:
+                    corrected = norm
+                else:
+                    base = os.path.basename(norm)
+                    matches = [p for p in structure.known if p.endswith("/" + base)]
+                    if matches:
+                        corrected = matches[0]
+                        needs_fixing[0] = True
+                    else:
+                        unknown_files_out.append(norm)
+                        corrected = norm
+                s = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
+                s.write(data)
+                s.seek(0)
+                scripts.append((norm, corrected, s))
+    finally:
+        z.close()
+    return scripts
 
-def load_scripts_from_pak_files(pak_file_paths: Iterable[Path]) -> List[ScriptFile]:
+def load_all_scripts_from_all_pak_files(pak_file_paths: Iterable[Path]) -> List[ScriptFile]:
     all_scripts: List[ScriptFile] = []
     for path in pak_file_paths:
         all_scripts.extend(read_scripts_from_single_pak(path, os.path.basename(path)))
     return all_scripts
 
+# --- Archive helpers (sniff + 7z fallback)
+
+def _sniff_archive_type(path: Path) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(8)
+        if sig.startswith(b"PK\x03\x04") or sig.startswith(b"PK\x05\x06") or sig.startswith(b"PK\x07\x08"):
+            return "zip"
+        if sig.startswith(b"7z\xBC\xAF'") or sig.startswith(b"7z\xBC\xAF\x27\x1C"):
+            return "7z"
+        if sig.startswith(b"Rar!\x1A\x07\x00") or sig.startswith(b"Rar!\x1A\x07\x01\x00"):
+            return "rar"
+    except Exception:
+        return None
+    return None
+
+def _which_7z() -> Optional[str]:
+    cand = shutil.which("7z")
+    if cand:
+        return cand
+    if sys.platform.startswith("win"):
+        for p in (r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
+            if os.path.exists(p):
+                return p
+    return None
+
+def _yield_pak_streams_with_7z_cli(path: Path, log: Optional[Callable[[str], None]] = None) -> Iterator[Tuple[str, "BytesIO"]]:
+    from io import BytesIO
+    exe = _which_7z()
+    if not exe:
+        if log:
+            log("7-Zip CLI not found on PATH; cannot fallback to 7z.")
+        return
+    try:
+        proc = subprocess.run([exe, "l", "-slt", "-ba", str(path)], capture_output=True, text=True)
+        if proc.returncode != 0:
+            if log:
+                log(f"7z list failed for '{path.name}': {proc.stderr.strip()}")
+            return
+        names: List[str] = []
+        for line in proc.stdout.splitlines():
+            if line.startswith("Path = "):
+                name = line.split("Path = ", 1)[1].strip()
+                if name.lower().endswith(".pak"):
+                    names.append(name)
+        if not names and log:
+            log(f"No .pak inside '{path.name}' (via 7z).")
+        for name in names:
+            proc2 = subprocess.run([exe, "x", "-so", str(path), name], capture_output=True)
+            if proc2.returncode != 0:
+                if log:
+                    log(f"7z extract failed for '{name}' in '{path.name}': {proc2.stderr.decode(errors='ignore').strip()}")
+                continue
+            yield name, BytesIO(proc2.stdout)
+    except Exception as e:
+        if log:
+            log(f"7z fallback error for '{path.name}': {e}")
+
+def _yield_pak_streams_from_archive(path: Path, log: Optional[Callable[[str], None]] = None) -> Iterator[Tuple[str, "BytesIO"]]:
+    """Yield (inner_name, BytesIO) for each .pak found inside .zip/.rar/.7z (robust, with header sniff + 7z fallback)."""
+    from io import BytesIO
+
+    kind = _sniff_archive_type(path) or path.suffix.lower().lstrip(".")
+    kind = (kind or "").lower()
+
+    if kind == "zip":
+        try:
+            with zipfile.ZipFile(path, "r") as z:
+                for entry in z.namelist():
+                    if entry.endswith(".pak") and not entry.endswith("/"):
+                        yield entry, BytesIO(z.read(entry))
+        except Exception as e:
+            if log:
+                log(f"ERROR reading ZIP '{path.name}': {e}")
+
+    elif kind == "rar":
+        used = False
+        if rarfile is not None:
+            try:
+                with rarfile.RarFile(path) as rf:  # type: ignore
+                    for info in rf.infolist():
+                        name = getattr(info, "filename", "")
+                        if str(name).endswith(".pak"):
+                            with rf.open(info) as f:
+                                yield str(name), BytesIO(f.read())
+                                used = True
+            except Exception as e:
+                if log:
+                    log(f"ERROR reading RAR '{path.name}': {e}")
+        if not used:
+            for tup in _yield_pak_streams_with_7z_cli(path, log=log):
+                yield tup
+
+    elif kind in ("7z", "7zip"):
+        used = False
+        if py7zr is not None:
+            try:
+                with py7zr.SevenZipFile(path, "r") as sz:  # type: ignore
+                    try:
+                        names = [n for n in sz.getnames() if n.endswith(".pak")]
+                    except Exception:
+                        names = [i.filename for i in sz.list() if i.filename.endswith(".pak")]
+                    if names:
+                        data_map = sz.read(names)
+                        for name, blob in data_map.items():
+                            try:
+                                data = blob.read()
+                            except Exception:
+                                data = bytes(blob)
+                            yield name, BytesIO(data)
+                            used = True
+            except Exception as e:
+                if log:
+                    log(f"ERROR reading 7z '{path.name}': {e}")
+        if not used:
+            for tup in _yield_pak_streams_with_7z_cli(path, log=log):
+                yield tup
+    else:
+        if log:
+            log(f"Unsupported or unknown archive type: '{path.name}'")
 
 def load_all_scripts_from_mods_folder(paths: Iterable[Path]) -> List[ScriptFile]:
     scripts: List[ScriptFile] = []
     for mod_file_path in paths:
         try:
             source_name = os.path.basename(mod_file_path)
-            suf = mod_file_path.suffix.lower()
-            if suf == ".pak":
+            suf = (_sniff_archive_type(mod_file_path) or mod_file_path.suffix.lower().lstrip(".")).lower()
+            if suf == "pak":
                 scripts.extend(read_scripts_from_single_pak(mod_file_path, source_name))
-            elif suf == ".zip":
-                with zipfile.ZipFile(mod_file_path, "r") as archive:
-                    for entry in archive.namelist():
-                        if entry.endswith(".pak"):
-                            with archive.open(entry) as pak_entry_stream:
-                                from io import BytesIO
-
-                                mem_stream = BytesIO(pak_entry_stream.read())
-                                scripts.extend(read_scripts_from_single_pak(mem_stream, source_name))
+            elif suf in ("zip", "rar", "7z", "7zip"):
+                found = False
+                for _, mem_stream in _yield_pak_streams_from_archive(mod_file_path):
+                    found = True
+                    scripts.extend(read_scripts_from_single_pak(mem_stream, source_name))
+                if not found:
+                    print(f"WARNING: No .pak found inside '{source_name}'. Skipping.")
             else:
                 print(f"Unsupported mod archive type: {mod_file_path}")
         except Exception as e:
             print(f"ERROR: Could not read '{os.path.basename(mod_file_path)}'. Reason: {e}")
     return scripts
 
+# ---- Merge logic (honors per-file preference)
 
-_key_regex = re.compile(r'^(\w+)\s*\(\s*"([^"]+)"')
+def merge_scripts(
+    original: ScriptFile,
+    mods: List[ScriptFile],
+    ask_user: Callable[[List[Tuple[str, str]], tk.Tk], Tuple[str, Optional[str]]],
+    parent: tk.Tk,
+) -> str:
+    """Resolve conflicts by key; allow the user to pick and optionally apply preference for the rest of the file."""
+    def try_parse_key_local(line: str) -> Optional[str]:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        parts = re.split(r"\s+", line, maxsplit=1)
+        if len(parts) < 2:
+            return None
+        lhs, rhs = parts[0], parts[1]
+        if lhs.isdigit():
+            return None
+        return f"{lhs}_{rhs.split()[0] if rhs else ''}"
 
+    original_map: Dict[str, str] = {}
+    for line in original.content.replace("\r\n", "\n").split("\n"):
+        key = try_parse_key_local(line)
+        if key and key not in original_map:
+            original_map[key] = line
 
-def try_parse_key(line: str) -> Optional[str]:
-    line = line.strip()
-    m = _key_regex.match(line)
-    if m:
-        return f"{m.group(1)}_{m.group(2)}"
-    return None
+    preferred_source_for_file: Optional[str] = None  # set after first "apply" selection
 
+    for mod in mods:
+        for line in mod.content.replace("\r\n", "\n").split("\n"):
+            key = try_parse_key_local(line)
+            if not key:
+                continue
+            if key in original_map and original_map[key] != line:
+                if preferred_source_for_file == original.source:
+                    continue  # keep existing original
+                if preferred_source_for_file == mod.source:
+                    original_map[key] = line
+                    continue
+                choice, prefer_src = ask_user([(original_map[key], original.source), (line, mod.source)], parent)
+                original_map[key] = choice
+                if prefer_src:
+                    preferred_source_for_file = prefer_src
+            else:
+                original_map[key] = line
 
-# ---- UI helpers for thread ↔ UI sync
-class UiSync:
-    """Run a callable in the Tk main thread and wait for its return value."""
+    return "\n".join(original_map[k] for k in original_map.keys())
 
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.q: "queue.Queue[Tuple[Callable, threading.Event, List, Dict]]" = queue.Queue()
-        self.root.after(50, self._pump)
+# ---- UI for conflict resolution (radio buttons + "apply to rest of file")
 
-    def _pump(self):
-        try:
-            while True:
-                func, evt, args, kwargs = self.q.get_nowait()
-                try:
-                    result = func(*args, **kwargs)
-                except Exception as e:
-                    result = e
-                kwargs["__result__"] = result
-                evt.set()
-        except queue.Empty:
-            pass
-        self.root.after(50, self._pump)
-
-    def call(self, func: Callable, *args, **kwargs):
-        evt = threading.Event()
-        kwargs2 = dict(kwargs)
-        self.q.put((func, evt, list(args), kwargs2))
-        evt.wait()
-        res = kwargs2.get("__result__")
-        if isinstance(res, Exception):
-            raise res
-        return res
-
-
-def ask_conflict_choice_dialog(
-    parent: tk.Tk, file_path: str, key: str, options: List[Tuple[str, List[str]]]
-) -> Tuple[str, Optional[str]]:
+def ask_user_to_resolve_conflict(options: List[Tuple[str, str]], parent: tk.Tk) -> Tuple[str, Optional[str]]:
+    """Return (chosen_line, preferred_source_or_None)."""
     dlg = tk.Toplevel(parent)
-    dlg.title(f"Conflict: {Path(file_path).name} - {key}")
+    dlg.title("Resolve Conflict")
+    dlg.geometry("760x420")
+    dlg.transient(parent)
     dlg.grab_set()
-    dlg.resizable(True, True)
 
-    tk.Label(dlg, text=f"Conflict in {file_path}\nKey: {key}", justify="left").pack(anchor="w", padx=10, pady=6)
+    tk.Label(dlg, text="A conflict was found. Choose which line to keep:").pack(anchor="w", padx=10, pady=8)
 
-    prefer_var = tk.BooleanVar(value=False)
     frame = tk.Frame(dlg)
-    frame.pack(fill="both", expand=True, padx=10, pady=6)
-    lb = tk.Listbox(frame)
-    lb.pack(side="left", fill="both", expand=True)
-    sb = tk.Scrollbar(frame, command=lb.yview)
-    sb.pack(side="right", fill="y")
-    lb.config(yscrollcommand=sb.set)
+    frame.pack(fill="both", expand=True, padx=10)
 
-    source_map: Dict[int, Optional[str]] = {}
-    for idx, (line_text, sources) in enumerate(options):
-        lb.insert(tk.END, f"{idx+1}. ({', '.join(sources)}): {line_text.strip()}")
-        source_map[idx] = sources[0] if sources else None
-    lb.selection_set(0)
+    sel_var = tk.IntVar(value=0)
+    prefer_var = tk.BooleanVar(value=False)
 
-    def on_ok():
-        sel = lb.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        chosen_line = options[idx][0]
-        chosen_source = source_map[idx] if prefer_var.get() else None
-        dlg.__result__ = (chosen_line, chosen_source)
-        dlg.destroy()
+    # Option 0 (usually ORIGINAL)
+    o0 = tk.Frame(frame)
+    o0.pack(fill="x", pady=4)
+    tk.Radiobutton(o0, text=f"Use from: {options[0][1]}", variable=sel_var, value=0).pack(anchor="w")
+    t0 = tk.Text(o0, height=6, wrap="none")
+    t0.pack(fill="x")
+    t0.insert("1.0", options[0][0])
+    t0.config(state="disabled")
 
-    tk.Checkbutton(dlg, text="Prefer this mod for the rest of this FILE", variable=prefer_var).pack(
-        anchor="w", padx=10
+    # Option 1 (MOD)
+    o1 = tk.Frame(frame)
+    o1.pack(fill="x", pady=6)
+    tk.Radiobutton(o1, text=f"Use from: {options[1][1]}", variable=sel_var, value=1).pack(anchor="w")
+    t1 = tk.Text(o1, height=6, wrap="none")
+    t1.pack(fill="x")
+    t1.insert("1.0", options[1][0])
+    t1.config(state="disabled")
+
+    tk.Checkbutton(dlg, text="Apply this choice to the rest of this file", variable=prefer_var).pack(
+        anchor="w", padx=10, pady=4
     )
 
     btns = tk.Frame(dlg)
     btns.pack(fill="x", padx=10, pady=10)
+
+    def on_ok():
+        idx = sel_var.get()
+        chosen_line = options[idx][0]
+        chosen_source = options[idx][1] if prefer_var.get() else None
+        dlg.__result__ = (chosen_line, chosen_source)
+        dlg.destroy()
+
     tk.Button(btns, text="OK", command=on_ok).pack(side="right")
     tk.Button(btns, text="Cancel", command=lambda: dlg.destroy()).pack(side="right", padx=6)
 
     parent.wait_window(dlg)
     return getattr(dlg, "__result__", (options[0][0], None))
 
-
 def generate_merged_file_content(
     original: ScriptFile,
     mods: List[ScriptFile],
-    ui_sync: UiSync,
+    ui_sync: "UiSync",
     parent: tk.Tk,
 ) -> str:
     original_map: Dict[str, str] = {}
@@ -357,77 +489,89 @@ def generate_merged_file_content(
         if key and key not in original_map:
             original_map[key] = line
 
-    mod_maps: List[Dict] = []
+    preferred_source_for_file: Optional[str] = None
+
+    def ask(opts: List[Tuple[str, str]]) -> Tuple[str, Optional[str]]:
+        return ui_sync.call(ask_user_to_resolve_conflict, opts, parent)  # type: ignore
+
     for mod in mods:
-        mod_map: Dict[str, str] = {}
         for line in mod.content.replace("\r\n", "\n").split("\n"):
             key = try_parse_key(line)
-            if key and key not in mod_map:
-                mod_map[key] = line
-        mod_maps.append({"source_pak": mod.source_pak, "map": mod_map})
-
-    final_content: List[str] = []
-    resolutions: Dict[str, str] = {}
-    preferred_mod_source: Optional[str] = None
-    auto_resolved_count = 0
-    original_lines = original.content.replace("\r\n", "\n").split("\n")
-
-    for original_line in original_lines:
-        key = try_parse_key(original_line)
-        if key is None:
-            final_content.append(original_line)
-            continue
-
-        if key in resolutions:
-            final_content.append(resolutions[key])
-            continue
-
-        actual_changes: List[Tuple[str, str]] = []
-        base_line = original_map.get(key)
-        for mod in mod_maps:
-            mod_line = mod["map"].get(key)
-            if mod_line and mod_line != base_line:
-                actual_changes.append((mod_line, mod["source_pak"]))
-
-        if len(actual_changes) == 0:
-            final_content.append(original_line)
-        elif len(actual_changes) == 1:
-            final_content.append(actual_changes[0][0])
-            resolutions[key] = actual_changes[0][0]
-        else:
-            distinct_changes: Dict[str, List[str]] = {}
-            for line, src in actual_changes:
-                distinct_changes.setdefault(line, []).append(src)
-
-            if len(distinct_changes) == 1:
-                line = next(iter(distinct_changes))
-                final_content.append(line)
-                resolutions[key] = line
+            if not key:
+                continue
+            if key in original_map and original_map[key] != line:
+                if preferred_source_for_file == original.source:
+                    continue
+                if preferred_source_for_file == mod.source:
+                    original_map[key] = line
+                    continue
+                choice, prefer = ask([(original_map[key], original.source), (line, mod.source)])
+                original_map[key] = choice
+                if prefer:
+                    preferred_source_for_file = prefer
             else:
-                if preferred_mod_source:
-                    chosen_line = next(
-                        (line for line, sources in distinct_changes.items() if preferred_mod_source in sources),
-                        next(iter(distinct_changes)),
-                    )
-                    auto_resolved_count += 1
-                else:
-                    opts = list(distinct_changes.items())
-                    chosen_line, chosen_source = ui_sync.call(
-                        ask_conflict_choice_dialog,
-                        parent,
-                        original.full_path_in_pak,
-                        key,
-                        opts,
-                    )
-                    if chosen_source:
-                        preferred_mod_source = chosen_source
-                final_content.append(chosen_line)
-                resolutions[key] = chosen_line
+                original_map[key] = line
 
-    if auto_resolved_count > 0:
-        print(f"Auto-resolved {auto_resolved_count} conflicts using preference: '{preferred_mod_source}'.")
-    return "\n".join(final_content)
+    return "\n".join(original_map.values())
 
+# ---- Simple parsing / key extraction
+
+_key_regex = re.compile(r"\s*([^\s]+)\s+([^\s]+)")
+
+def try_parse_key(line: str) -> Optional[str]:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    m = _key_regex.match(line)
+    if m:
+        return f"{m.group(1)}_{m.group(2)}"
+    return None
+
+# ---- UI helpers for thread ↔ UI sync
+class UiSync:
+    """Run a callable in the Tk main thread and wait for its return value."""
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.q: "queue.Queue[Tuple[Callable, threading.Event, List, Dict]]" = queue.Queue()
+        self.root.after(10, self._poll)
+
+    def call(self, func: Callable, *args, **kwargs):
+        ev = threading.Event()
+        self.q.put((func, ev, list(args), dict(kwargs)))
+        ev.wait()
+        return getattr(self, "_last_result", None)
+
+    def _poll(self):
+        try:
+            while True:
+                func, ev, args, kwargs = self.q.get_nowait()
+                try:
+                    self._last_result = func(*args, **kwargs)
+                except Exception as e:
+                    print("UiSync error:", e)
+                    self._last_result = None
+                ev.set()
+        except queue.Empty:
+            pass
+        self.root.after(10, self._poll)
+
+# ---- Default directory validation helpers
+
+def folder_has_data0(path: str | Path) -> bool:
+    p = Path(path)
+    return p.is_dir() and (p / "data0.pak").exists()
+
+def validate_game_folder(path: str | Path) -> Tuple[bool, str]:
+    p = Path(path)
+    if not p.exists():
+        return False, "Folder does not exist."
+    if not p.is_dir():
+        return False, "Path is not a directory."
+    if not (p / "data0.pak").exists():
+        return False, "data0.pak not found in this folder."
+    return True, ""
+
+# ---- Merge runner
 
 def fix_mod_structures_ui(
     game_pak_path: Path, mod_paths: List[Path], temp_root: Path, ui_sync: UiSync, parent: tk.Tk, log: Callable[[str], None]
@@ -441,17 +585,25 @@ def fix_mod_structures_ui(
         fixed_pak_path = temp_dir / "fixed.pak"
         unknown_files: List[str] = []
         try:
-            if mod_file.suffix.lower() == ".pak":
-                _ = read_scripts_from_single_pak_for_fixing(mod_file, needs_fixing, structure, unknown_files)
-            else:
-                with zipfile.ZipFile(mod_file, "r") as archive:
-                    for entry in archive.namelist():
-                        if entry.endswith(".pak"):
-                            with archive.open(entry) as pak_entry_stream:
-                                from io import BytesIO
+            kind = _sniff_archive_type(mod_file) or mod_file.suffix.lower().lstrip(".")
+            kind = (kind or "").lower()
+            found_any = False
 
-                                mem_stream = BytesIO(pak_entry_stream.read())
-                                _ = read_scripts_from_single_pak_for_fixing(mem_stream, needs_fixing, structure, unknown_files)
+            if kind == "pak":
+                _ = read_scripts_from_single_pak_for_fixing(mod_file, needs_fixing, structure, unknown_files)
+                found_any = True
+            elif kind in ("zip", "rar", "7z", "7zip"):
+                for _, mem_stream in _yield_pak_streams_from_archive(mod_file, log=log):
+                    found_any = True
+                    _ = read_scripts_from_single_pak_for_fixing(mem_stream, needs_fixing, structure, unknown_files)
+            else:
+                log(f"Unsupported mod archive type: {mod_file.name}")
+                continue
+
+            if not found_any:
+                log(f"No .pak inside '{mod_name}'. Skipping.")
+                continue
+
             if unknown_files:
                 msg = (
                     f"Mod '{mod_name}' has files not found in data0.pak:\n"
@@ -469,11 +621,19 @@ def fix_mod_structures_ui(
 
             if needs_fixing[0]:
                 with zipfile.ZipFile(fixed_pak_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    scripts = read_scripts_from_single_pak_for_fixing(mod_file, needs_fixing, structure, [])
-                    for _, correct_path, content_stream in scripts:
-                        content_stream.seek(0)
-                        zf.writestr(correct_path.replace("\\", "/"), content_stream.read())
-                        content_stream.close()
+                    if kind == "pak":
+                        scripts = read_scripts_from_single_pak_for_fixing(mod_file, needs_fixing, structure, [])
+                        for _, correct_path, content_stream in scripts:
+                            content_stream.seek(0)
+                            zf.writestr(correct_path.replace("\\", "/"), content_stream.read())
+                            content_stream.close()
+                    else:
+                        for _, mem_stream in _yield_pak_streams_from_archive(mod_file, log=log):
+                            scripts = read_scripts_from_single_pak_for_fixing(mem_stream, needs_fixing, structure, [])
+                            for _, correct_path, content_stream in scripts:
+                                content_stream.seek(0)
+                                zf.writestr(correct_path.replace("\\", "/"), content_stream.read())
+                                content_stream.close()
                 fixed_zip_path = temp_dir / f"{mod_name}_fixed.zip"
                 with zipfile.ZipFile(fixed_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
                     zf.write(fixed_pak_path, "mod.pak")
@@ -485,7 +645,6 @@ def fix_mod_structures_ui(
         except Exception as e:
             log(f"ERROR processing '{mod_name}': {e}")
     return valid
-
 
 def run_merge(
     game_folder: Path,
@@ -505,401 +664,509 @@ def run_merge(
         log("Fixing mod folder structures (if needed)...")
         valid_mods = fix_mod_structures_ui(data0, mod_paths, temp_root, ui_sync, parent, log)
 
-        log("Loading original scripts from game packages...")
-        source_paks = list(game_folder.glob("*.pak"))
-        originals = load_scripts_from_pak_files(source_paks)
-        log(f"✓ {len(originals)} original scripts loaded.")
+        log("Loading original scripts and mods...")
+        original_scripts = load_all_scripts_from_all_pak_files([data0])
+        mod_scripts = load_all_scripts_from_mods_folder(valid_mods)
 
-        log("Loading scripts from mods...")
-        modded = load_all_scripts_from_mods_folder(valid_mods)
-        log(f"✓ {len(modded)} modded scripts loaded.")
+        by_rel: Dict[str, List[ScriptFile]] = defaultdict(list)
+        originals: Dict[str, ScriptFile] = {}
 
-        log("Merging...")
-        final_contents: Dict[str, str] = {}
-        mod_file_groups: Dict[str, List[ScriptFile]] = defaultdict(list)
-        for scr in modded:
-            mod_file_groups[scr.full_path_in_pak].append(scr)
+        for s in original_scripts:
+            originals[s.rel_path] = s
+        for s in mod_scripts:
+            by_rel[s.rel_path].append(s)
 
-        originals_by_path: Dict[str, ScriptFile] = {o.full_path_in_pak.lower(): o for o in originals}
+        merged_zip_path = staging_root / "merged.zip"
+        merged_count = 0
+        with zipfile.ZipFile(merged_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for rel_path, mods in by_rel.items():
+                if rel_path in originals:
+                    content = merge_scripts(
+                        originals[rel_path],
+                        mods,
+                        lambda opts, root=parent: ui_sync.call(ask_user_to_resolve_conflict, opts, root),
+                        parent,
+                    )
+                    zf.writestr(rel_path, content)
+                    merged_count += 1
+                else:
+                    zf.writestr(rel_path, mods[-1].content)
+                    merged_count += 1
+        log(f"Merged {merged_count} files.")
 
-        for file_path, mods_touching in mod_file_groups.items():
-            if len(mods_touching) == 1:
-                final_contents[file_path] = mods_touching[0].content
-                continue
-            orig = originals_by_path.get(file_path.lower())
-            if orig is None:
-                final_contents[file_path] = mods_touching[0].content
-                continue
-            merged = generate_merged_file_content(orig, mods_touching, ui_sync, parent)
-            final_contents[file_path] = merged
-
-        log(f"Merged files: {len(final_contents)}")
-        log("Creating package...")
-
-        staging_dir = staging_root / "staging_area"
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
-        safe_mkdir(staging_dir)
-
-        for file_entry, content in final_contents.items():
-            full_path = staging_dir / Path(file_entry)
-            safe_mkdir(full_path.parent)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
+        if merged_count == 0:
+            messagebox.showinfo("Nothing to merge", "No mergeable scripts were found.\nNothing was installed.", parent=parent)
+            return None
 
         name = next_data_name(str(game_folder))
-        final_pak_path = game_folder / name
-        if final_pak_path.exists():
-            final_pak_path.unlink()
-
-        zip_base = final_pak_path.with_suffix("")
-        shutil.make_archive(str(zip_base), "zip", staging_dir)
-        zip_path = zip_base.with_suffix(".zip")
-        if zip_path.exists():
-            zip_path.rename(final_pak_path)
-
-        log(f"SUCCESS: Created {final_pak_path.name}")
-        return final_pak_path
+        final_path = game_folder / name
+        shutil.copy2(merged_zip_path, final_path)
+        log(f"Installed merged pak as {final_path.name}")
+        return final_path
     finally:
         try:
             shutil.rmtree(staging_root, ignore_errors=True)
+        except Exception:
+            pass
+        try:
             shutil.rmtree(temp_root, ignore_errors=True)
         except Exception:
             pass
 
+# ---- UI
 
-# ---- GUI
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.settings = load_settings()
-        if not self.settings.get("game_folder"):
-            found_path = None
-            possible_drives = [chr(x) for x in range(ord('A'), ord('Z') + 1)]
-            for drive in possible_drives:
-                candidate = Path(f"{drive}:\\Program Files (x86)\\Steam\\steamapps\\common\\Dying Light The Beast\\ph_ft\\source")
-                print(f"Trying: {candidate}")
-                if candidate.exists():
-                    found_path = str(candidate)
-                    break
-            if found_path:
-                dir_path = Path(found_path)
-                self.settings["game_folder"] = found_path
-                save_settings(self.settings)
-        # Theme before building widgets
-        self.dark_mode = bool(self.settings.get("dark_mode", False))
-        self.palette: Dict[str, str] = {}
-        self.apply_theme(self.dark_mode)
+        root.title(APP_NAME)
+        root.geometry("1024x640")
 
         self.ui_sync = UiSync(root)
+        self.settings = load_settings()
 
-        root.title("Dying Light: The Beast")
-        root.geometry("980x640")
+        self.palette = {
+            "light": {
+                "bg": "#f7f7fb",
+                "bg2": "#ffffff",
+                "fg": "#1f2937",
+                "acc": "#2563eb",
+                "entry_bg": "#ffffff",
+                "entry_fg": "#111827",
+                "entry_insert": "#111827",
+                "label_bg": "#f7f7fb",
+                "label_fg": "#1f2937",
+                "listbox_bg": "#ffffff",
+                "listbox_fg": "#111827",
+                "listbox_sel_bg": "#c7d2fe",
+                "listbox_sel_fg": "#111827",
+                "text_bg": "#ffffff",
+                "text_fg": "#111827",
+                "text_insert": "#111827",
+            },
+            "dark": {
+                "bg": "#0b1221",
+                "bg2": "#111827",
+                "fg": "#e5e7eb",
+                "acc": "#60a5fa",
+                "entry_bg": "#111827",
+                "entry_fg": "#e5e7eb",
+                "entry_insert": "#e5e7eb",
+                "label_bg": "#0b1221",
+                "label_fg": "#e5e7eb",
+                "listbox_bg": "#111827",
+                "listbox_fg": "#e5e7eb",
+                "listbox_sel_bg": "#374151",
+                "listbox_sel_fg": "#e5e7eb",
+                "text_bg": "#111827",
+                "text_fg": "#e5e7eb",
+                "text_insert": "#e5e7eb",
+            },
+        }
 
-        # Menu: View ▸ Dark Mode
-        menubar = tk.Menu(root)
-        view_menu = tk.Menu(menubar, tearoff=False)
-        self.dark_var = tk.BooleanVar(value=self.dark_mode)
-        view_menu.add_checkbutton(label="Dark Mode", variable=self.dark_var, command=self.on_toggle_dark_mode)
-        menubar.add_cascade(label="View", menu=view_menu)
-        root.config(menu=menubar)
+        self._build_ui()
+        self._apply_palette()
+        self._restyle_existing_widgets()
 
-        # Top: game folder selector
-        top = tk.Frame(root)
-        top.pack(fill="x", padx=10, pady=8)
+        # Init game folder (saved/default/scan), then fill UI lists
+        self._init_game_folder()
+        self.refresh_file_list()
+        self.refresh_merge_queue()
 
-        tk.Label(top, text="Game Source Folder (contains data0.pak):").pack(side="left")
-        self.game_folder_var = tk.StringVar(value=self.settings.get("game_folder", ""))
-        self.game_entry = tk.Entry(top, textvariable=self.game_folder_var, width=80)
-        self.game_entry.pack(side="left", padx=8, fill="x", expand=True)
-        tk.Button(top, text="Browse...", command=self.on_browse_game_folder).pack(side="left")
+        # F5 refresh
+        self.root.bind("<F5>", lambda e: self.refresh_file_list())
 
-        # Main split
-        main = tk.PanedWindow(root, sashrelief="raised")
-        main.pack(fill="both", expand=True, padx=10, pady=6)
+    # --- Default directory handling
 
-        # Left: installed .pak manager
+    def _init_game_folder(self) -> None:
+        """Choose saved folder, else default, else scan A:..Z:, else prompt."""
+        # 1) Saved setting
+        saved = str(self.settings.get("game_folder", "")).strip()
+        if saved and folder_has_data0(saved):
+            self.game_entry.delete(0, "end")
+            self.game_entry.insert(0, saved)
+            return
+
+        # 2) Hard-coded default
+        if folder_has_data0(DEFAULT_GAME_DIR):
+            self.settings["game_folder"] = DEFAULT_GAME_DIR
+            save_settings(self.settings)
+            self.game_entry.delete(0, "end")
+            self.game_entry.insert(0, DEFAULT_GAME_DIR)
+            return
+
+        # 3) Scan drives A–Z for the Steam install path you specified
+        found_path: Optional[str] = None
+        possible_drives = [chr(x) for x in range(ord('A'), ord('Z') + 1)]
+        for drive in possible_drives:
+            candidate = Path(f"{drive}:\\Program Files (x86)\\Steam\\steamapps\\common\\Dying Light The Beast\\ph_ft\\source")
+            print(f"Trying: {candidate}")
+            if candidate.exists() and (candidate / "data0.pak").exists():
+                found_path = str(candidate)
+                break
+        if found_path:
+            self.settings["game_folder"] = found_path
+            save_settings(self.settings)
+            self.game_entry.delete(0, "end")
+            self.game_entry.insert(0, found_path)
+            return
+
+        # 4) Prompt user
+        messagebox.showinfo(
+            "Game folder not set",
+            "Select the Dying Light (The Beast) source folder that contains 'data0.pak'.",
+            parent=self.root,
+        )
+        self.on_browse_game_folder()
+
+    def ensure_valid_game_folder(self, interactive: bool = True) -> bool:
+        """Validate current folder; try default/scan; optionally prompt."""
+        gf = self.game_entry.get().strip() or str(self.settings.get("game_folder", "")).strip()
+        ok, why = validate_game_folder(gf) if gf else (False, "No folder set.")
+        if ok:
+            if gf != self.settings.get("game_folder", ""):
+                self.settings["game_folder"] = gf
+                save_settings(self.settings)
+            return True
+
+        if not interactive:
+            return False
+
+        # Try default
+        if folder_has_data0(DEFAULT_GAME_DIR):
+            use_default = messagebox.askyesno(
+                "Use default directory?",
+                f"Current folder is invalid ({why}).\n\nUse default?\n\n{DEFAULT_GAME_DIR}",
+                parent=self.root,
+            )
+            if use_default:
+                self.settings["game_folder"] = DEFAULT_GAME_DIR
+                save_settings(self.settings)
+                self.game_entry.delete(0, "end")
+                self.game_entry.insert(0, DEFAULT_GAME_DIR)
+                return True
+
+        # Try scan
+        found_path: Optional[str] = None
+        for drive in [chr(x) for x in range(ord('A'), ord('Z') + 1)]:
+            candidate = Path(f"{drive}:\\Program Files (x86)\\Steam\\steamapps\\common\\Dying Light The Beast\\ph_ft\\source")
+            print(f"Trying: {candidate}")
+            if candidate.exists() and (candidate / "data0.pak").exists():
+                found_path = str(candidate)
+                break
+        if found_path:
+            self.settings["game_folder"] = found_path
+            save_settings(self.settings)
+            self.game_entry.delete(0, "end")
+            self.game_entry.insert(0, found_path)
+            return True
+
+        # Prompt browse
+        messagebox.showwarning("Select game folder", f"Invalid folder ({why}). Please pick the folder with 'data0.pak'.", parent=self.root)
+        self.on_browse_game_folder()
+        gf2 = self.game_entry.get().strip()
+        ok2, _ = validate_game_folder(gf2) if gf2 else (False, "")
+        return ok2
+
+    # --- UI construction
+    def _build_ui(self):
+        root = self.root
+        self.root.minsize(960, 520)
+
+        main = tk.Frame(root)
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
         left = tk.Frame(main)
-        main.add(left, minsize=360)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
 
-        tk.Label(left, text="Installed data*.pak in Game Folder:").pack(anchor="w")
-        self.file_list = tk.Listbox(left)
-        self.file_list.pack(fill="both", expand=True, pady=4)
+        right = tk.Frame(main)
+        right.pack(side="left", fill="both", expand=True)
+
+        # Game folder selection
+        tk.Label(left, text="Game Source Folder (contains data0.pak):").pack(anchor="w")
+        top_row = tk.Frame(left)
+        top_row.pack(fill="x")
+
+        self.game_entry = tk.Entry(top_row)
+        self.game_entry.pack(side="left", fill="x", expand=True)
+        self.game_entry.insert(0, self.settings.get("game_folder", ""))
+
+        tk.Button(top_row, text="Browse...", command=self.on_browse_game_folder).pack(side="left", padx=5)
 
         btns = tk.Frame(left)
-        btns.pack(fill="x", pady=4)
-        tk.Button(btns, text="Set Nickname", command=self.on_set_nickname).pack(side="left", padx=2)
-        tk.Button(btns, text="Set Link", command=self.on_set_link).pack(side="left", padx=2)
-        tk.Button(btns, text="Open Link", command=self.on_open_link).pack(side="left", padx=2)
-        tk.Button(btns, text="Activate/Deactivate", command=self.on_toggle_active).pack(side="left", padx=2)
-        tk.Button(btns, text="Delete", command=self.on_delete).pack(side="left", padx=2)
+        btns.pack(fill="x", pady=6)
+        tk.Button(btns, text="Open Folder", command=self.on_open_game_folder).pack(side="left")
+        tk.Button(btns, text="Refresh", command=self.refresh_file_list).pack(side="left", padx=8)  # refresh with validation
+        tk.Button(btns, text="Toggle Dark Mode", command=self.on_toggle_dark_mode).pack(side="left", padx=8)
 
         # Drop area to copy .pak into game folder
         self.install_drop = tk.Label(
-            left, text="➕ Drop .pak files here to INSTALL into game folder", relief="ridge", padx=8, pady=18
+            left, text="➕ Drop .pak/.zip/.rar/.7z here to INSTALL into game folder", relief="ridge", padx=8, pady=18
         )
         self.install_drop.pack(fill="x", pady=4)
 
-        # Right: merge queue
-        right = tk.Frame(main)
-        main.add(right)
+        # List of installed files
+        tk.Label(left, text="Installed Pak Files:").pack(anchor="w")
+        self.file_list = tk.Listbox(left, height=10, selectmode="extended")
+        self.file_list.pack(fill="both", expand=True)
 
-        tk.Label(right, text="Merge Queue (.pak or .zip, each may contain .pak):").pack(anchor="w")
-        self.merge_list = tk.Listbox(right)
-        self.merge_list.pack(fill="both", expand=True, pady=4)
+        file_btns = tk.Frame(left)
+        file_btns.pack(fill="x", pady=6)
+        tk.Button(file_btns, text="Remove", command=self.on_remove_selected).pack(side="left")
+        tk.Button(file_btns, text="Rename", command=self.on_rename_selected).pack(side="left", padx=6)
+        tk.Button(file_btns, text="Disable/Enable", command=self.on_toggle_active).pack(side="left", padx=6)
 
-        mbtns = tk.Frame(right)
-        mbtns.pack(fill="x", pady=4)
-        tk.Button(mbtns, text="Add Files…", command=self.on_add_merge_files).pack(side="left", padx=2)
-        tk.Button(mbtns, text="Remove Selected", command=self.on_remove_merge_files).pack(side="left", padx=2)
-        tk.Button(mbtns, text="Clear", command=self.on_clear_merge_files).pack(side="left", padx=2)
-        tk.Button(mbtns, text="Run Merge ▶", command=self.on_run_merge).pack(side="right", padx=2)
+        # Merge queue (right panel)
+        tk.Label(right, text="Merge Queue (.pak/.zip/.rar/.7z; archives may contain .pak):").pack(anchor="w")
 
-        # Log console
-        tk.Label(root, text="Log:").pack(anchor="w", padx=10)
-        self.log_txt = tk.Text(root, height=10, state="disabled")
-        self.log_txt.pack(fill="both", expand=False, padx=10, pady=(0, 10))
+        merge_btns = tk.Frame(right)
+        merge_btns.pack(fill="x")
 
-        # DnD init
+        tk.Button(merge_btns, text="Add...", command=self.on_add_merge_files).pack(side="left")
+        tk.Button(merge_btns, text="Remove", command=self.on_remove_merge_files).pack(side="left", padx=6)
+        tk.Button(merge_btns, text="Clear", command=self.on_clear_merge_files).pack(side="left", padx=6)
+
+        self.merge_list = tk.Listbox(right, height=10, selectmode="extended")
+        self.merge_list.pack(fill="both", expand=True)
+
+        # Drag & drop areas if tkinterdnd2 available
         if TKDND_OK and isinstance(root, TkinterDnD.Tk):  # type: ignore
             self.install_drop.drop_target_register(DND_FILES)  # type: ignore
             self.install_drop.dnd_bind("<<Drop>>", self.on_drop_install)  # type: ignore
 
             self.merge_drop = tk.Label(
-                right, text="➕ Or drop .pak/.zip here to add to MERGE", relief="ridge", padx=8, pady=12
+                right, text="➕ Or drop .pak/.zip/.rar/.7z here to add to MERGE", relief="ridge", padx=8, pady=12
             )
             self.merge_drop.pack(fill="x", pady=4)
             self.merge_drop.drop_target_register(DND_FILES)  # type: ignore
             self.merge_drop.dnd_bind("<<Drop>>", self.on_drop_merge)  # type: ignore
         else:
             self.merge_drop = None
-            self.install_drop.config(text="Drag & drop requires tkinterdnd2. Use buttons instead.")
+            # keep your custom footer text
+            self.install_drop.config(text="Created by UnknownGamer and Pacmanninja998.")
 
-        # Load persisted merge queue
-        for p in self.settings.get("merge_queue", []):
-            if os.path.exists(p):
-                self.merge_list.insert(tk.END, p)
+        # Merge action
+        action = tk.Frame(right)
+        action.pack(fill="x", pady=8)
+        tk.Button(action, text="Run MERGE", command=self.on_run_merge).pack(side="left")
+        
+        footer = tk.Label(self.root, text="Created by UnknownGamer and Pacmanninja998", font=("Segoe UI", 8), name="footerlabel")
+        footer.pack(side="bottom", pady=1)
 
-        # Apply palette to already-created widgets
-        self._restyle_existing_widgets()
-        self.refresh_file_list()
+    # --- Styling / palette
 
-    # ---- Theme handling
-    def apply_theme(self, dark: bool) -> None:
-        # Keep our own palette to avoid empty values from option DB
-        if dark:
-            bg, bg2, fg, acc, sel_bg, sel_fg = "#1f2124", "#2b2d31", "#e6e6e6", "#3a3d41", "#3b82f6", "#ffffff"
-        else:
-            bg, bg2, fg, acc, sel_bg, sel_fg = "#f3f3f3", "#ffffff", "#202020", "#e0e0e0", "#316ac5", "#ffffff"
+    def _apply_palette(self) -> None:
+        dm = bool(self.settings.get("dark_mode", False))
+        pal = self.palette["dark" if dm else "light"]
+        self.palette_active = pal
 
-        self.palette = {
-            # containers & labels
-            "label_bg": bg,
-            "label_fg": fg,
-            # entries
-            "entry_bg": bg2,
-            "entry_fg": fg,
-            "entry_insert": fg,
-            # listboxes
-            "listbox_bg": bg2,
-            "listbox_fg": fg,
-            "listbox_sel_bg": sel_bg,
-            "listbox_sel_fg": sel_fg,
-            # text
-            "text_bg": bg2,
-            "text_fg": fg,
-            "text_insert": fg,
-        }
+        def o(opt, val):
+            try:
+                self.root.option_add(opt, val)
+            except Exception:
+                pass
 
-        # Option DB is still set for future widgets (ok if ignored)
-        o = self.root.option_add
-        o("*Frame.background", bg)
+        bg = pal["bg"]
+        bg2 = pal["bg2"]
+        fg = pal["fg"]
+        acc = pal["acc"]
+
+        FONT_UI = ("Segoe UI", 10)   # tuple → avoids Tcl font tokenization issues
+        FONT_MONO = ("Consolas", 10)
+
+        o("*Font",           FONT_UI)
+        o("*Button.font",    FONT_UI)
+        o("*TButton.font",   FONT_UI)
+        o("*Entry.font",     FONT_UI)
+        o("*Label.font",     FONT_UI)
+        o("*Listbox.font",   FONT_UI)
+        o("*Text.font",      FONT_MONO)
+
+        o("*Button.background", bg2)
+        o("*Button.foreground", fg)
         o("*Label.background", bg)
         o("*Label.foreground", fg)
-        o("*Entry.background", bg2)
-        o("*Entry.foreground", fg)
-        o("*Entry.insertBackground", fg)
-        o("*Listbox.background", bg2)
-        o("*Listbox.foreground", fg)
-        o("*Listbox.selectBackground", sel_bg)
-        o("*Listbox.selectForeground", sel_fg)
-        o("*Text.background", bg2)
-        o("*Text.foreground", fg)
-        o("*Text.insertBackground", fg)
-        o("*Button.background", acc)
-        o("*Button.activeBackground", sel_bg)
-        o("*Button.foreground", fg)
-        o("*Checkbutton.background", bg)
-        o("*Checkbutton.foreground", fg)
-        o("*Menubutton.background", acc)
-        o("*Menubutton.foreground", fg)
-        o("*Menu.background", bg2)
-        o("*Menu.foreground", fg)
+        o("*Frame.background", bg)
+        o("*Entry.background", pal["entry_bg"])
+        o("*Entry.foreground", pal["entry_fg"])
+        o("*Listbox.background", pal["listbox_bg"])
+        o("*Listbox.foreground", pal["listbox_fg"])
+        o("*Text.background", pal["text_bg"])
+        o("*Text.foreground", pal["text_fg"])
         o("*highlightBackground", bg)
         o("*highlightColor", bg)
+        o("*selectBackground", pal["listbox_sel_bg"])
+        o("*selectForeground", pal["listbox_sel_fg"])
+        o("*activeForeground", fg)
+        o("*activeBackground", acc)
+        o("*troughColor", bg2)
+        o("*borderColor", bg)
+        o("*background", bg)
 
         self.root.configure(bg=bg)
 
     def _restyle_existing_widgets(self) -> None:
-        # Use explicit colors from our palette (why: avoid empty strings from option_get)
+        pal = self.palette_active
+
         def style_entry(w: tk.Entry):
-            w.config(bg=self.palette["entry_bg"], fg=self.palette["entry_fg"], insertbackground=self.palette["entry_insert"])
+            w.config(bg=pal["entry_bg"], fg=pal["entry_fg"], insertbackground=pal["entry_insert"])
 
         def style_label(w: tk.Label):
-            w.config(bg=self.palette["label_bg"], fg=self.palette["label_fg"])
+            w.config(bg=pal["label_bg"], fg=pal["label_fg"])
 
         def style_listbox(w: tk.Listbox):
             w.config(
-                bg=self.palette["listbox_bg"],
-                fg=self.palette["listbox_fg"],
-                selectbackground=self.palette["listbox_sel_bg"],
-                selectforeground=self.palette["listbox_sel_fg"],
+                bg=pal["listbox_bg"],
+                fg=pal["listbox_fg"],
+                selectbackground=pal["listbox_sel_bg"],
+                selectforeground=pal["listbox_sel_fg"],
             )
 
         def style_text(w: tk.Text):
-            w.config(bg=self.palette["text_bg"], fg=self.palette["text_fg"], insertbackground=self.palette["text_insert"])
+            w.config(bg=pal["text_bg"], fg=pal["text_fg"], insertbackground=pal["text_insert"])
 
-        # Specific widgets
         style_entry(self.game_entry)
         style_label(self.install_drop)
-        if isinstance(getattr(self, "merge_drop", None), tk.Label):
-            style_label(self.merge_drop)  # type: ignore
         style_listbox(self.file_list)
         style_listbox(self.merge_list)
-        style_text(self.log_txt)
+        if isinstance(getattr(self, "merge_drop", None), tk.Label):
+            style_label(self.merge_drop)  # type: ignore
 
-    def on_toggle_dark_mode(self) -> None:
-        self.dark_mode = bool(self.dark_var.get())
-        self.apply_theme(self.dark_mode)
+    # --- Commands
+
+    def on_browse_game_folder(self):
+        p = filedialog.askdirectory(title="Select game source folder (contains data0.pak)")
+        if p:
+            ok, why = validate_game_folder(p)
+            if not ok:
+                messagebox.showerror("Invalid folder", f"{why}\n\nPick the folder with 'data0.pak'.")
+                return
+            self.game_entry.delete(0, "end")
+            self.game_entry.insert(0, p)
+            self.settings["game_folder"] = p
+            save_settings(self.settings)
+            self.refresh_file_list()
+
+    def on_open_game_folder(self):
+        gf = self.settings.get("game_folder", "")
+        if not gf:
+            messagebox.showerror("No game folder set", "Set the game folder above first.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(gf)  # type: ignore
+            elif sys.platform.startswith("darwin"):
+                subprocess.check_call(["open", gf])
+            else:
+                subprocess.check_call(["xdg-open", gf])
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open folder:\n{e}")
+
+    def on_toggle_dark_mode(self):
+        self.settings["dark_mode"] = not bool(self.settings.get("dark_mode", False))
+        save_settings(self.settings)
+        self._apply_palette()
         self._restyle_existing_widgets()
-        self.settings["dark_mode"] = self.dark_mode
+
+    def refresh_file_list(self):
+        """Rescan the game folder and refresh the installed pak list (validates first)."""
+        if not self.ensure_valid_game_folder(interactive=True):
+            return
+        gf = self.game_entry.get().strip() or self.settings.get("game_folder", "")
+        if gf and gf != self.settings.get("game_folder", ""):
+            self.settings["game_folder"] = gf
+            save_settings(self.settings)
+        self.file_list.delete(0, "end")
+        if not gf:
+            return
+        try:
+            names = sorted([n for n in os.listdir(gf) if n.lower().endswith(".pak")])
+        except Exception:
+            names = []
+        for n in names:
+            meta = self.settings.setdefault("files", {}).get(n, {})
+            nick = meta.get("nickname", "")
+            active = meta.get("active", True)
+            label = n
+            if nick:
+                label += f" — {nick}"
+            if not active:
+                label += " (disabled)"
+            self.file_list.insert("end", label)
         save_settings(self.settings)
 
-    # ---- Logging
-    def log(self, msg: str) -> None:
-        self.log_txt.config(state="normal")
-        self.log_txt.insert(tk.END, msg + "\n")
-        self.log_txt.see(tk.END)
-        self.log_txt.config(state="disabled")
-        self.log_txt.update_idletasks()
-
-    # ---- Game folder selection
-    def on_browse_game_folder(self):
-        folder = filedialog.askdirectory(title="Select Game Source Folder")
-        if not folder:
+    def on_remove_selected(self):
+        gf = self.settings.get("game_folder", "")
+        if not gf:
+            messagebox.showerror("No game folder set", "Set the game folder above first.")
             return
-        self.game_folder_var.set(folder)
-        self.settings["game_folder"] = folder
+        sel = list(self.file_list.curselection())
+        if not sel:
+            return
+        names = sorted([n for n in os.listdir(gf) if n.lower().endswith(".pak")])
+        sel_names = []
+        for i in sel:
+            if i < len(names):
+                sel_names.append(names[i])
+        if not sel_names:
+            return
+        if not messagebox.askyesno("Confirm Delete", f"Delete selected files?\n\n" + "\n".join(sel_names)):
+            return
+        for n in sel_names:
+            try:
+                os.remove(os.path.join(gf, n))
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to delete {n}:\n{e}")
+            self.settings.setdefault("files", {}).pop(n, None)
         save_settings(self.settings)
         self.refresh_file_list()
 
-    # ---- File list helpers & actions
-    def _selected_filename(self) -> Optional[str]:
-        sel = self.file_list.curselection()
-        if not sel:
-            return None
-        val = self.file_list.get(sel[0])
-        return val.split(" | ")[0].split(" [")[0]
-
-    def refresh_file_list(self):
-        self.file_list.delete(0, tk.END)
+    def on_rename_selected(self):
         gf = self.settings.get("game_folder", "")
-        if not os.path.isdir(gf):
+        if not gf:
+            messagebox.showerror("No game folder set", "Set the game folder above first.")
             return
-        files = os.listdir(gf)
-        self.settings["files"] = {k: v for k, v in self.settings.get("files", {}).items() if k in files}
-        idx = 0
-        for fname in sorted(files):
-            if fname.startswith("data") and (fname.endswith(".pak") or fname.endswith(".pak.disabled")):
-                meta = self.settings["files"].setdefault(
-                    fname, {"nickname": "", "link": "", "active": fname.endswith(".pak")}
-                )
-                display = fname
-                if not meta["active"]:
-                    display += " [deactivated]"
-                if meta.get("nickname"):
-                    display += f" | {meta['nickname']}"
-                self.file_list.insert(tk.END, display)
-                color = "green" if meta["active"] else "red"
-                self.file_list.itemconfig(idx, {"fg": color})
-                idx += 1
-        save_settings(self.settings)
-
-    def on_set_nickname(self):
-        fname = self._selected_filename()
-        if not fname:
+        sel = list(self.file_list.curselection())
+        if len(sel) != 1:
+            messagebox.showwarning("Select One", "Select exactly one file to rename.")
             return
-        initial = self.settings["files"].get(fname, {}).get("nickname", "")
-        nick = simpledialog.askstring("Set Nickname", f"Enter nickname for {fname}:", initialvalue=initial)
-        if nick is not None:
-            self.settings["files"].setdefault(fname, {}).update({"nickname": nick})
-            save_settings(self.settings)
-            self.refresh_file_list()
-
-    def on_set_link(self):
-        fname = self._selected_filename()
-        if not fname:
+        names = sorted([n for n in os.listdir(gf) if n.lower().endswith(".pak")])
+        idx = sel[0]
+        if idx >= len(names):
             return
-        initial = self.settings["files"].get(fname, {}).get("link", "")
-        link = simpledialog.askstring("Set Link", f"Enter clickable URL for {fname}:", initialvalue=initial)
-        if link is not None:
-            self.settings["files"].setdefault(fname, {}).update({"link": link})
-            save_settings(self.settings)
-            self.refresh_file_list()
-
-    def on_open_link(self):
-        import webbrowser
-        fname = self._selected_filename()
-        if not fname:
+        old = names[idx]
+        new = simpledialog.askstring("Rename", "New filename (with .pak):", initialvalue=old)
+        if not new:
             return
-        link = self.settings["files"].get(fname, {}).get("link")
-        if link:
-            webbrowser.open(link)
-
-    def on_delete(self):
-        fname = self._selected_filename()
-        if not fname:
-            return
-        gf = self.settings.get("game_folder", "")
-        path = os.path.join(gf, fname)
-        if messagebox.askyesno("Delete File", f"Delete file {fname}? This cannot be undone."):
-            try:
-                os.remove(path)
-                self.settings["files"].pop(fname, None)
-                save_settings(self.settings)
-                self.refresh_file_list()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to delete file:\n{e}")
-
-    def on_toggle_active(self):
-        fname = self._selected_filename()
-        if not fname:
-            return
-        gf = self.settings.get("game_folder", "")
-        path = os.path.join(gf, fname)
-        meta = self.settings["files"].get(fname)
-        if not meta:
+        new = new.strip()
+        if not new.lower().endswith(".pak"):
+            messagebox.showerror("Invalid name", "Filename must end with .pak")
             return
         try:
-            if meta["active"]:
-                new_path = path + ".disabled"
-                os.rename(path, new_path)
-                meta["active"] = False
-                self.settings["files"][fname + ".disabled"] = self.settings["files"].pop(fname)
-            else:
-                if fname.endswith(".disabled"):
-                    new_name = fname[:-9]
-                    new_path = os.path.join(gf, new_name)
-                else:
-                    new_name = fname
-                    new_path = path
-                os.rename(path, new_path)
-                meta["active"] = True
-                self.settings["files"][new_name] = self.settings["files"].pop(fname)
-            save_settings(self.settings)
-            self.refresh_file_list()
+            os.rename(os.path.join(gf, old), os.path.join(gf, new))
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to toggle activation:\n{e}")
+            messagebox.showerror("Error", f"Failed to rename:\n{e}")
+            return
+        meta = self.settings.setdefault("files", {}).pop(old, {})
+        self.settings["files"][new] = meta
+        save_settings(self.settings)
+        self.refresh_file_list()
+
+    def on_toggle_active(self):
+        gf = self.settings.get("game_folder", "")
+        if not gf:
+            messagebox.showerror("No game folder set", "Set the game folder above first.")
+            return
+        sel = list(self.file_list.curselection())
+        if not sel:
+            return
+        names = sorted([n for n in os.listdir(gf) if n.lower().endswith(".pak")])
+        for i in sel:
+            if i < len(names):
+                n = names[i]
+                meta = self.settings.setdefault("files", {}).setdefault(n, {"nickname": "", "link": "", "active": True})
+                meta["active"] = not bool(meta.get("active", True))
+        save_settings(self.settings)
+        self.refresh_file_list()
 
     # ---- Drag/drop install
     def on_drop_install(self, event):
@@ -912,18 +1179,38 @@ class App:
             if not os.path.isfile(f):
                 messagebox.showwarning("Warning", f"Skipping non-file: {f}")
                 continue
-            if not f.lower().endswith(".pak"):
-                messagebox.showwarning("Warning", f"Skipping non-.pak file: {f}")
+            suf = (_sniff_archive_type(Path(f)) or os.path.splitext(f)[1].lower().lstrip(".")).lower()
+            if suf == "pak":
+                new_name = next_data_name(gf)
+                shutil.copy2(f, os.path.join(gf, new_name))
+                self.settings.setdefault("files", {})[new_name] = {"nickname": "", "link": "", "active": True}
+            elif suf in ("zip", "rar", "7z", "7zip"):
+                inner = list(_yield_pak_streams_from_archive(Path(f)))
+                if len(inner) == 0:
+                    messagebox.showwarning("Warning", f"No .pak found inside: {os.path.basename(f)}")
+                    continue
+                if len(inner) > 1:
+                    messagebox.showwarning(
+                        "Warning",
+                        f"Found {len(inner)} .pak files inside {os.path.basename(f)}. Use the MERGE queue instead.",
+                    )
+                    continue
+                _, mem_stream = inner[0]
+                mem_stream.seek(0)
+                new_name = next_data_name(gf)
+                with open(os.path.join(gf, new_name), "wb") as out:
+                    out.write(mem_stream.read())
+                self.settings.setdefault("files", {})[new_name] = {"nickname": "", "link": "", "active": True}
+            else:
+                messagebox.showwarning("Warning", f"Unsupported file type: {f}")
                 continue
-            new_name = next_data_name(gf)
-            shutil.copy2(f, os.path.join(gf, new_name))
-            self.settings["files"][new_name] = {"nickname": "", "link": "", "active": True}
         self.refresh_file_list()
 
     # ---- Merge queue
     def on_add_merge_files(self):
         paths = filedialog.askopenfilenames(
-            title="Select Mod Archives (.pak/.zip)", filetypes=[("Mod archives", "*.pak *.zip"), ("All files", "*.*")]
+            title="Select Mod Archives (.pak/.zip/.rar/.7z)",
+            filetypes=[("Mod archives", "*.pak *.zip *.rar *.7z"), ("All files", "*.*")],
         )
         if not paths:
             return
@@ -944,10 +1231,15 @@ class App:
         self.merge_list.delete(0, tk.END)
         self.persist_merge_queue()
 
+    def refresh_merge_queue(self):
+        self.merge_list.delete(0, "end")
+        for p in self.settings.get("merge_queue", []):
+            self.merge_list.insert("end", p)
+
     def on_drop_merge(self, event):
         files = parse_drop_files(event.data)
         for f in files:
-            if os.path.isfile(f) and f.lower().endswith((".pak", ".zip")):
+            if os.path.isfile(f) and f.lower().endswith((".pak", ".zip", ".rar", ".7z", ".7zip")):
                 self.merge_list.insert(tk.END, f)
         self.persist_merge_queue()
 
@@ -957,16 +1249,17 @@ class App:
 
     # ---- Merge action
     def on_run_merge(self):
-        gf = self.settings.get("game_folder", "")
-        if not gf or not os.path.isdir(gf):
-            messagebox.showerror("No game folder set", "Set the game folder above first.")
+        if not self.ensure_valid_game_folder(interactive=True):
             return
+        gf = self.game_entry.get().strip()
+        self.settings["game_folder"] = gf
+        save_settings(self.settings)
+
         queue_paths = list(self.merge_list.get(0, tk.END))
         if not queue_paths:
-            messagebox.showinfo("Empty Queue", "Add .pak/.zip files to the merge queue first.")
+            messagebox.showwarning("Empty queue", "Add at least one mod archive (.pak/.zip/.rar/.7z).")
             return
 
-        self.root.config(cursor="watch")
         for w in (self.game_entry, self.file_list, self.merge_list):
             w.config(state="disabled")
 
@@ -981,23 +1274,40 @@ class App:
                 )
                 if res:
                     self.log(f"Done: {res}")
+                    self.root.after(500, self.refresh_file_list)
+            except Exception as e:
+                self.log(f"ERROR: {e}")
+                messagebox.showerror("Merge failed", f"{e}")
             finally:
                 def reenable():
-                    self.root.config(cursor="")
                     for w in (self.game_entry, self.file_list, self.merge_list):
                         w.config(state="normal")
-                    self.refresh_file_list()
-
                 self.root.after(0, reenable)
 
         threading.Thread(target=worker, daemon=True).start()
 
+    # ---- Logging
+    def log(self, msg: str):
+        print(msg)
 
 def main():
-    root = TkinterDnD.Tk() if TKDND_OK else tk.Tk()  # type: ignore
-    app = App(root)
-    root.mainloop()
-
+    try:
+        root = TkinterDnD.Tk() if TKDND_OK else tk.Tk()  # type: ignore
+        app = App(root)
+        root.mainloop()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showerror("Startup error", tb)
+        except Exception:
+            pass
+        try:
+            input("Press Enter to exit...")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
