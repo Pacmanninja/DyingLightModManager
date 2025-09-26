@@ -1,0 +1,60 @@
+{
+  "mod_folder": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Dying Light The Beast\\ph_ft\\source",
+  "files": {
+    "data0.pak": {
+      "nickname": "Game Asset",
+      "link": "",
+      "active": true
+    },
+    "data1.pak": {
+      "nickname": "Game Asset",
+      "link": "",
+      "active": true
+    },
+    "data2.pak": {
+      "nickname": "Skip Intro Video",
+      "link": "",
+      "active": true
+    },
+    "data3.pak": {
+      "nickname": "Increased Loot Detection",
+      "link": "",
+      "active": true
+    },
+    "data4.pak": {
+      "nickname": "Easy Lockpicking",
+      "link": "",
+      "active": true
+    },
+    "data5.pak": {
+      "nickname": "More Fuel",
+      "link": "",
+      "active": true
+    },
+    "data6.pak": {
+      "nickname": "Swap Jump and Kick",
+      "link": "https://www.nexusmods.com/dyinglightthebeast/mods/146",
+      "active": true
+    },
+    "data7.pak": {
+      "nickname": "Free Blueprints",
+      "link": "https://www.nexusmods.com/dyinglightthebeast/mods/5",
+      "active": true
+    },
+    "data8.pak": {
+      "nickname": "Inf Ammo",
+      "link": "https://www.nexusmods.com/dyinglightthebeast/mods/135",
+      "active": true
+    },
+    "data9.pak": {
+      "nickname": "Inf Durability",
+      "link": "https://www.nexusmods.com/dyinglightthebeast/mods/135",
+      "active": true
+    },
+    "data10.pak.disabled": {
+      "nickname": "Faster Healing & Inf Stamina",
+      "link": "https://www.nexusmods.com/dyinglightthebeast/mods/135",
+      "active": false
+    }
+  }
+}

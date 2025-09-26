@@ -375,12 +375,19 @@ def load_all_scripts_from_mods_folder(paths: Iterable[Path]) -> List[ScriptFile]
 # ---- Merge logic (honors per-file preference)
 
 def merge_scripts(
-    original: ScriptFile,
-    mods: List[ScriptFile],
+    original: 'ScriptFile',
+    mods: List['ScriptFile'],
     ask_user: Callable[[List[Tuple[str, str]], tk.Tk], Tuple[str, Optional[str]]],
     parent: tk.Tk,
 ) -> str:
-    """Resolve conflicts by key; allow the user to pick and optionally apply preference for the rest of the file."""
+    """
+    Merge mods against original by matching files inside pak folders ignoring archive names,
+    checking line by line, prompting user on conflicting changes with full lines including comments.
+    Works with single file strings or dict of {filepath: content string}.
+    """
+
+    base_sources = ("data0.pak", "data1.pak")
+
     def try_parse_key_local(line: str) -> Optional[str]:
         line = line.strip()
         if not line or line.startswith("#"):
@@ -393,36 +400,57 @@ def merge_scripts(
             return None
         return f"{lhs}_{rhs.split()[0] if rhs else ''}"
 
-    original_map: Dict[str, str] = {}
-    for line in original.content.replace("\r\n", "\n").split("\n"):
-        key = try_parse_key_local(line)
-        if key and key not in original_map:
-            original_map[key] = line
+    # Normalize original.content to dict of filepath -> lines list
+    if isinstance(original.content, str):
+        original_files = {"main_file": original.content.replace("\r\n", "\n").split("\n")}
+    else:
+        original_files = {fp: fc.replace("\r\n", "\n").split("\n") for fp, fc in original.content.items()}
 
-    preferred_source_for_file: Optional[str] = None  # set after first "apply" selection
-
+    mod_files_list = []
+    mod_sources = []
     for mod in mods:
-        for line in mod.content.replace("\r\n", "\n").split("\n"):
-            key = try_parse_key_local(line)
-            if not key:
-                continue
-            if key in original_map and original_map[key] != line:
-                if original.source.endswith("data0.pak"):
-                    original_map[key] = line
-                    continue
-                if preferred_source_for_file == original.source:
-                    continue  # keep existing original
-                if preferred_source_for_file == mod.source:
-                    original_map[key] = line
-                    continue
-                choice, prefer_src = ask_user([(original_map[key], original.source), (line, mod.source)], parent)
-                original_map[key] = choice
-                if prefer_src:
-                    preferred_source_for_file = prefer_src
-            else:
-                original_map[key] = line
+        if isinstance(mod.content, str):
+            mod_files_list.append({"main_file": mod.content.replace("\r\n", "\n").split("\n")})
+        else:
+            mod_files_list.append({fp: fc.replace("\r\n", "\n").split("\n") for fp, fc in mod.content.items()})
+        mod_sources.append(mod.source)
 
-    return "\n".join(original_map[k] for k in original_map.keys())
+    merged_files = {}
+
+    all_paths = set(original_files.keys())
+    for mod_files in mod_files_list:
+        all_paths.update(mod_files.keys())
+
+    for path in sorted(all_paths):
+        base_lines = original_files.get(path, [])
+        mods_lines_for_file = [mod_files.get(path, []) for mod_files in mod_files_list]
+        max_len = max(len(base_lines), *(len(lines) for lines in mods_lines_for_file))
+
+        merged_lines = []
+
+        for i in range(max_len):
+            base_line = base_lines[i] if i < len(base_lines) else ""
+            mod_line_entries = []
+
+            for mod_idx, lines in enumerate(mods_lines_for_file):
+                mod_line = lines[i] if i < len(lines) else ""
+                if mod_line != base_line:
+                    mod_line_entries.append((mod_line, mod_sources[mod_idx]))
+
+            if not mod_line_entries:
+                merged_lines.append(base_line)
+            else:
+                unique_mod_lines = list({line for line, _ in mod_line_entries})
+                if len(unique_mod_lines) == 1:
+                    merged_lines.append(unique_mod_lines[0])
+                else:
+                    choice, _ = ask_user(mod_line_entries, parent)
+                    merged_lines.append(choice if choice is not None else base_line)
+
+        merged_files[path] = "\n".join(merged_lines)
+
+    return "\n\n".join(f"// File: {path}\n{content}" for path, content in merged_files.items())
+
 
 # ---- UI for conflict resolution (radio buttons + "apply to rest of file")
 

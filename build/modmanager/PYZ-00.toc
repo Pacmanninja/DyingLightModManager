@@ -1,4 +1,4 @@
-('C:\\Users\\pacmanninja998\\Desktop\\Coding\\DyingLightTheBeastModManager\\build\\modmanager\\PYZ-00.pyz',
+('C:\\Users\\pacmanninja998\\Documents\\GitHub\\DyingLightModManager\\build\\modmanager\\PYZ-00.pyz',
  [('Crypto',
    'C:\\Users\\pacmanninja998\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\Crypto\\__init__.py',
    'PYMODULE'),
